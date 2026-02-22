@@ -162,4 +162,4 @@ pnpm run all           # All of the above
 
 ## License
 
-MIT
+Proprietary. Copyright ProdCycle, Inc. All rights reserved.
