@@ -2,7 +2,7 @@
 
 A GitHub Action that scans pull request changes for compliance violations against SOC 2, HIPAA, ISO 27001, NIST CSF, PCI DSS, GDPR, and CCPA frameworks via the [ProdCycle](https://prodcycle.com) API.
 
-> **Requires a ProdCycle account.** This action calls the ProdCycle compliance API, which requires a valid CVK API key (`cvk_...`). [Sign up at prodcycle.com](https://prodcycle.com) to get started.
+> **Requires a ProdCycle account.** This action calls the ProdCycle compliance API, which requires a valid CVK API key (`cvk_...`). [Sign up at prodcycle.com](https://app.prodcycle.com) to get started.
 
 ## How it works
 
