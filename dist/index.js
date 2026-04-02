@@ -30057,6 +30057,18 @@ async function postSummaryComment(findings, summary, scanId, passed, apiUrl) {
     }
 }
 function buildCommentBody(findings, summary, scanId, passed, apiUrl) {
+    // No controls evaluated — nothing relevant in the diff
+    if (summary.total === 0) {
+        const lines = [
+            "### ⏭️ Compliance Scan — No Relevant Changes",
+            "",
+            "No infrastructure or policy-relevant code was found in this PR's changed files.",
+            "Controls are evaluated when changes include Terraform, Kubernetes, Dockerfiles, CI configs, IAM policies, environment files, or application source code.",
+            "",
+            `Scan ID: \`${scanId}\``,
+        ];
+        return lines.join("\n");
+    }
     const status = passed
         ? "### ✅ Compliance Check Passed"
         : "### ❌ Compliance Check Failed";
@@ -30113,16 +30125,28 @@ function buildCommentBody(findings, summary, scanId, passed, apiUrl) {
  * Write a GitHub Actions job summary (visible in the Actions tab).
  */
 function writeJobSummary(summary, scanId, passed, fileCount) {
-    const status = passed ? "✅ Passed" : "❌ Failed";
-    const md = [
-        `## Compliance Code Scanner — ${status}`,
-        "",
-        `| Files scanned | Findings | Passed | Failed |`,
-        `|:---:|:---:|:---:|:---:|`,
-        `| ${fileCount} | ${summary.total} | ${summary.passed} | ${summary.failed} |`,
-        "",
-        `Scan ID: \`${scanId}\``,
-    ].join("\n");
+    let md;
+    if (summary.total === 0) {
+        md = [
+            `## Compliance Code Scanner — ⏭️ No Relevant Changes`,
+            "",
+            `${fileCount} file(s) scanned. No infrastructure or policy-relevant code found in this PR.`,
+            "",
+            `Scan ID: \`${scanId}\``,
+        ].join("\n");
+    }
+    else {
+        const status = passed ? "✅ Passed" : "❌ Failed";
+        md = [
+            `## Compliance Code Scanner — ${status}`,
+            "",
+            `| Files scanned | Findings | Passed | Failed |`,
+            `|:---:|:---:|:---:|:---:|`,
+            `| ${fileCount} | ${summary.total} | ${summary.passed} | ${summary.failed} |`,
+            "",
+            `Scan ID: \`${scanId}\``,
+        ].join("\n");
+    }
     core.summary.addRaw(md).write();
 }
 

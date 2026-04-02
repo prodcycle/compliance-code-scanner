@@ -114,6 +114,19 @@ function buildCommentBody(
   passed: boolean,
   apiUrl: string,
 ): string {
+  // No controls evaluated — nothing relevant in the diff
+  if (summary.total === 0) {
+    const lines: string[] = [
+      "### ⏭️ Compliance Scan — No Relevant Changes",
+      "",
+      "No infrastructure or policy-relevant code was found in this PR's changed files.",
+      "Controls are evaluated when changes include Terraform, Kubernetes, Dockerfiles, CI configs, IAM policies, environment files, or application source code.",
+      "",
+      `Scan ID: \`${scanId}\``,
+    ];
+    return lines.join("\n");
+  }
+
   const status = passed
     ? "### ✅ Compliance Check Passed"
     : "### ❌ Compliance Check Failed";
@@ -190,17 +203,28 @@ export function writeJobSummary(
   passed: boolean,
   fileCount: number,
 ): void {
-  const status = passed ? "✅ Passed" : "❌ Failed";
+  let md: string;
 
-  const md = [
-    `## Compliance Code Scanner — ${status}`,
-    "",
-    `| Files scanned | Findings | Passed | Failed |`,
-    `|:---:|:---:|:---:|:---:|`,
-    `| ${fileCount} | ${summary.total} | ${summary.passed} | ${summary.failed} |`,
-    "",
-    `Scan ID: \`${scanId}\``,
-  ].join("\n");
+  if (summary.total === 0) {
+    md = [
+      `## Compliance Code Scanner — ⏭️ No Relevant Changes`,
+      "",
+      `${fileCount} file(s) scanned. No infrastructure or policy-relevant code found in this PR.`,
+      "",
+      `Scan ID: \`${scanId}\``,
+    ].join("\n");
+  } else {
+    const status = passed ? "✅ Passed" : "❌ Failed";
+    md = [
+      `## Compliance Code Scanner — ${status}`,
+      "",
+      `| Files scanned | Findings | Passed | Failed |`,
+      `|:---:|:---:|:---:|:---:|`,
+      `| ${fileCount} | ${summary.total} | ${summary.passed} | ${summary.failed} |`,
+      "",
+      `Scan ID: \`${scanId}\``,
+    ].join("\n");
+  }
 
   core.summary.addRaw(md).write();
 }
