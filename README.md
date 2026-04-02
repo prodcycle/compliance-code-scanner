@@ -35,6 +35,8 @@ jobs:
       - uses: prodcycle/compliance-code-scanner@v1
         with:
           api-key: ${{ secrets.PRODCYCLE_CVK }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 ```
 
 ## Prerequisites
@@ -82,6 +84,8 @@ Create `.github/workflows/compliance.yml` in your repository with the configurat
 | `findings-count` | Total number of findings                          |
 | `scan-id`        | ProdCycle scan ID for linking to the dashboard    |
 | `summary`        | JSON summary of results by severity and framework |
+
+> **Note:** The action needs `GITHUB_TOKEN` to post PR comments and inline annotations. Pass it as an environment variable: `env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }`. See the quick start example above.
 
 ## Examples
 
