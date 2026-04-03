@@ -30114,9 +30114,8 @@ function buildCommentBody(findings, summary, scanId, passed, apiUrl) {
         lines.push("</details>");
         lines.push("");
     }
-    // Dashboard link
-    const dashboardBase = apiUrl.replace("api.", "app.").replace(/\/+$/, "");
-    lines.push(`[View full report](${dashboardBase}/compliance/scans/${scanId}) | Scan ID: \`${scanId}\``);
+    // Scan ID for reference (dashboard page coming soon)
+    lines.push(`Scan ID: \`${scanId}\``);
     return lines.join("\n");
 }
 /**
