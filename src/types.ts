@@ -52,6 +52,8 @@ export interface ScanFinding {
   resourceType: string;
   resourcePath: string;
   resourceName: string;
+  startLine: number;
+  endLine: number;
   message: string;
   remediation: string;
 }

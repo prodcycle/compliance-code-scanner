@@ -29966,6 +29966,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.createAnnotations = createAnnotations;
 exports.postSummaryComment = postSummaryComment;
+exports.postReviewComments = postReviewComments;
 exports.writeJobSummary = writeJobSummary;
 const core = __importStar(__nccwpck_require__(6966));
 const github = __importStar(__nccwpck_require__(4903));
@@ -29998,21 +29999,27 @@ function createAnnotations(findings) {
             `Remediation: ${finding.remediation}`,
         ].join("\n");
         // Use @actions/core annotation which maps to the GitHub check annotation API
+        const annotationProps = {
+            title,
+            file: finding.resourcePath,
+            startLine: finding.startLine || undefined,
+            endLine: finding.endLine || undefined,
+        };
         if (level === "error") {
-            core.error(message, { title, file: finding.resourcePath });
+            core.error(message, annotationProps);
         }
         else if (level === "warning") {
-            core.warning(message, { title, file: finding.resourcePath });
+            core.warning(message, annotationProps);
         }
         else {
-            core.notice(message, { title, file: finding.resourcePath });
+            core.notice(message, annotationProps);
         }
     }
 }
 /**
  * Post or update a summary comment on the PR.
  */
-async function postSummaryComment(findings, summary, scanId, passed, apiUrl) {
+async function postSummaryComment(findings, summary, scanId, passed, _apiUrl) {
     const token = core.getInput("github-token") || process.env.GITHUB_TOKEN;
     if (!token) {
         core.warning("No GitHub token available. Skipping PR comment. Set the 'github-token' input or ensure GITHUB_TOKEN is in the environment.");
@@ -30026,7 +30033,7 @@ async function postSummaryComment(findings, summary, scanId, passed, apiUrl) {
     const octokit = github.getOctokit(token);
     const prNumber = context.payload.pull_request.number;
     const { owner, repo } = context.repo;
-    const body = buildCommentBody(findings, summary, scanId, passed, apiUrl);
+    const body = buildCommentBody(findings, summary, scanId, passed, _apiUrl);
     const marker = "<!-- prodcycle-compliance-code-scanner -->";
     const fullBody = `${marker}\n${body}`;
     // Look for an existing comment to update
@@ -30056,7 +30063,7 @@ async function postSummaryComment(findings, summary, scanId, passed, apiUrl) {
         core.debug("Created new PR comment");
     }
 }
-function buildCommentBody(findings, summary, scanId, passed, apiUrl) {
+function buildCommentBody(findings, summary, scanId, passed, _apiUrl) {
     if (summary.total === 0) {
         const lines = [
             "### ✅ Compliance Check Passed",
@@ -30117,6 +30124,80 @@ function buildCommentBody(findings, summary, scanId, passed, apiUrl) {
     // Scan ID for reference (dashboard page coming soon)
     lines.push(`Scan ID: \`${scanId}\``);
     return lines.join("\n");
+}
+/**
+ * Post a PR review with inline comments on the specific lines where findings
+ * were detected. This creates the same experience as review bots like Greptile —
+ * comments appear directly on the diff with the relevant code highlighted.
+ */
+async function postReviewComments(findings, passed) {
+    const token = core.getInput("github-token") || process.env.GITHUB_TOKEN;
+    if (!token) {
+        core.warning("No GitHub token available. Skipping PR review comments.");
+        return;
+    }
+    const context = github.context;
+    if (!context.payload.pull_request) {
+        core.debug("Not a pull request event. Skipping PR review comments.");
+        return;
+    }
+    // Only post review comments for findings that have line information
+    const reviewableFindings = findings.filter((f) => f.startLine > 0 && f.endLine > 0);
+    if (reviewableFindings.length === 0) {
+        core.debug("No findings with line information. Skipping PR review.");
+        return;
+    }
+    const octokit = github.getOctokit(token);
+    const prNumber = context.payload.pull_request.number;
+    const commitSha = context.payload.pull_request.head?.sha;
+    const { owner, repo } = context.repo;
+    if (!commitSha) {
+        core.warning("Could not determine head commit SHA. Skipping PR review.");
+        return;
+    }
+    const comments = reviewableFindings.map((f) => {
+        const icon = SEVERITY_ICONS[f.severity] || "";
+        const body = [
+            `${icon} **[${f.severity.toUpperCase()}] ${f.ruleId}**`,
+            "",
+            f.message,
+            "",
+            `> **Remediation:** ${f.remediation}`,
+            "",
+            `Framework: ${f.framework.toUpperCase()} (${f.controlId})`,
+        ].join("\n");
+        const comment = {
+            path: f.resourcePath,
+            body,
+            line: f.endLine,
+        };
+        // Use multi-line comment if the finding spans more than one line
+        if (f.startLine > 0 && f.startLine < f.endLine) {
+            comment.start_line = f.startLine;
+        }
+        return comment;
+    });
+    const event = passed ? "COMMENT" : "REQUEST_CHANGES";
+    const reviewBody = passed
+        ? "✅ **ProdCycle Compliance Scan** — findings detected but within acceptable thresholds."
+        : "❌ **ProdCycle Compliance Scan** — compliance violations found that require attention.";
+    try {
+        await octokit.rest.pulls.createReview({
+            owner,
+            repo,
+            pull_number: prNumber,
+            commit_id: commitSha,
+            event: event,
+            body: reviewBody,
+            comments,
+        });
+        core.info(`Posted PR review with ${comments.length} inline comment(s).`);
+    }
+    catch (err) {
+        // If the review fails (e.g., lines are outside the diff), fall back
+        // gracefully — the summary comment and annotations are still posted.
+        core.warning(`Failed to post PR review: ${err instanceof Error ? err.message : String(err)}`);
+    }
 }
 /**
  * Write a GitHub Actions job summary (visible in the Actions tab).
@@ -30734,7 +30815,16 @@ async function run() {
     if (inputs.annotate && result.findings.length > 0) {
         (0, annotate_1.createAnnotations)(result.findings);
     }
-    // ── 6. Post PR comment ──
+    // ── 6. Post PR review with inline comments ──
+    if (inputs.annotate && context.payload.pull_request && result.findings.length > 0) {
+        try {
+            await (0, annotate_1.postReviewComments)(result.findings, result.passed);
+        }
+        catch (err) {
+            core.warning(`Failed to post PR review comments: ${err instanceof Error ? err.message : String(err)}`);
+        }
+    }
+    // ── 7. Post PR summary comment ──
     if (inputs.comment && context.payload.pull_request) {
         try {
             await (0, annotate_1.postSummaryComment)(result.findings, result.summary, result.scanId, result.passed, inputs.apiUrl);
@@ -30743,9 +30833,9 @@ async function run() {
             core.warning(`Failed to post PR comment: ${err instanceof Error ? err.message : String(err)}`);
         }
     }
-    // ── 7. Write job summary ──
+    // ── 8. Write job summary ──
     (0, annotate_1.writeJobSummary)(result.summary, result.scanId, result.passed, files.length);
-    // ── 8. Fail the action if scan did not pass ──
+    // ── 9. Fail the action if scan did not pass ──
     if (!result.passed) {
         core.setFailed(`Compliance check failed: ${result.findingsCount} finding(s) detected. See annotations for details.`);
     }

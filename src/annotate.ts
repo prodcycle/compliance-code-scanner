@@ -38,12 +38,19 @@ export function createAnnotations(findings: ScanFinding[]): void {
     ].join("\n");
 
     // Use @actions/core annotation which maps to the GitHub check annotation API
+    const annotationProps: core.AnnotationProperties = {
+      title,
+      file: finding.resourcePath,
+      startLine: finding.startLine || undefined,
+      endLine: finding.endLine || undefined,
+    };
+
     if (level === "error") {
-      core.error(message, { title, file: finding.resourcePath });
+      core.error(message, annotationProps);
     } else if (level === "warning") {
-      core.warning(message, { title, file: finding.resourcePath });
+      core.warning(message, annotationProps);
     } else {
-      core.notice(message, { title, file: finding.resourcePath });
+      core.notice(message, annotationProps);
     }
   }
 }
@@ -56,7 +63,7 @@ export async function postSummaryComment(
   summary: ValidateSummary,
   scanId: string,
   passed: boolean,
-  apiUrl: string,
+  _apiUrl: string,
 ): Promise<void> {
   const token = core.getInput("github-token") || process.env.GITHUB_TOKEN;
   if (!token) {
@@ -74,7 +81,7 @@ export async function postSummaryComment(
   const prNumber = context.payload.pull_request.number;
   const { owner, repo } = context.repo;
 
-  const body = buildCommentBody(findings, summary, scanId, passed, apiUrl);
+  const body = buildCommentBody(findings, summary, scanId, passed, _apiUrl);
   const marker = "<!-- prodcycle-compliance-code-scanner -->";
   const fullBody = `${marker}\n${body}`;
 
@@ -112,7 +119,7 @@ function buildCommentBody(
   summary: ValidateSummary,
   scanId: string,
   passed: boolean,
-  apiUrl: string,
+  _apiUrl: string,
 ): string {
   if (summary.total === 0) {
     const lines: string[] = [
@@ -187,6 +194,105 @@ function buildCommentBody(
   lines.push(`Scan ID: \`${scanId}\``);
 
   return lines.join("\n");
+}
+
+/**
+ * Post a PR review with inline comments on the specific lines where findings
+ * were detected. This creates the same experience as review bots like Greptile —
+ * comments appear directly on the diff with the relevant code highlighted.
+ */
+export async function postReviewComments(
+  findings: ScanFinding[],
+  passed: boolean,
+): Promise<void> {
+  const token = core.getInput("github-token") || process.env.GITHUB_TOKEN;
+  if (!token) {
+    core.warning("No GitHub token available. Skipping PR review comments.");
+    return;
+  }
+
+  const context = github.context;
+  if (!context.payload.pull_request) {
+    core.debug("Not a pull request event. Skipping PR review comments.");
+    return;
+  }
+
+  // Only post review comments for findings that have line information
+  const reviewableFindings = findings.filter((f) => f.startLine > 0 && f.endLine > 0);
+  if (reviewableFindings.length === 0) {
+    core.debug("No findings with line information. Skipping PR review.");
+    return;
+  }
+
+  const octokit = github.getOctokit(token);
+  const prNumber = context.payload.pull_request.number;
+  const commitSha = context.payload.pull_request.head?.sha;
+  const { owner, repo } = context.repo;
+
+  if (!commitSha) {
+    core.warning("Could not determine head commit SHA. Skipping PR review.");
+    return;
+  }
+
+  const comments = reviewableFindings.map((f) => {
+    const icon = SEVERITY_ICONS[f.severity] || "";
+    const body = [
+      `${icon} **[${f.severity.toUpperCase()}] ${f.ruleId}**`,
+      "",
+      f.message,
+      "",
+      `> **Remediation:** ${f.remediation}`,
+      "",
+      `Framework: ${f.framework.toUpperCase()} (${f.controlId})`,
+    ].join("\n");
+
+    const comment: ReviewComment = {
+      path: f.resourcePath,
+      body,
+      line: f.endLine,
+    };
+
+    // Use multi-line comment if the finding spans more than one line
+    if (f.startLine > 0 && f.startLine < f.endLine) {
+      comment.start_line = f.startLine;
+    }
+
+    return comment;
+  });
+
+  const event = passed ? "COMMENT" : "REQUEST_CHANGES";
+  const reviewBody = passed
+    ? "✅ **ProdCycle Compliance Scan** — findings detected but within acceptable thresholds."
+    : "❌ **ProdCycle Compliance Scan** — compliance violations found that require attention.";
+
+  try {
+    await octokit.rest.pulls.createReview({
+      owner,
+      repo,
+      pull_number: prNumber,
+      commit_id: commitSha,
+      event: event as "COMMENT" | "REQUEST_CHANGES",
+      body: reviewBody,
+      comments,
+    });
+    core.info(
+      `Posted PR review with ${comments.length} inline comment(s).`,
+    );
+  } catch (err) {
+    // If the review fails (e.g., lines are outside the diff), fall back
+    // gracefully — the summary comment and annotations are still posted.
+    core.warning(
+      `Failed to post PR review: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/** Shape expected by octokit pulls.createReview comments */
+interface ReviewComment {
+  path: string;
+  body: string;
+  line: number;
+  start_line?: number;
 }
 
 /**

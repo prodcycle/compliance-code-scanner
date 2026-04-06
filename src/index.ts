@@ -16,6 +16,7 @@ import { collectChangedFiles } from "./diff";
 import { ComplianceApiClient } from "./api-client";
 import {
   createAnnotations,
+  postReviewComments,
   postSummaryComment,
   writeJobSummary,
 } from "./annotate";
@@ -124,7 +125,19 @@ async function run(): Promise<void> {
     createAnnotations(result.findings);
   }
 
-  // ── 6. Post PR comment ──
+  // ── 6. Post PR review with inline comments ──
+
+  if (inputs.annotate && context.payload.pull_request && result.findings.length > 0) {
+    try {
+      await postReviewComments(result.findings, result.passed);
+    } catch (err) {
+      core.warning(
+        `Failed to post PR review comments: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  // ── 7. Post PR summary comment ──
 
   if (inputs.comment && context.payload.pull_request) {
     try {
@@ -142,11 +155,11 @@ async function run(): Promise<void> {
     }
   }
 
-  // ── 7. Write job summary ──
+  // ── 8. Write job summary ──
 
   writeJobSummary(result.summary, result.scanId, result.passed, files.length);
 
-  // ── 8. Fail the action if scan did not pass ──
+  // ── 9. Fail the action if scan did not pass ──
 
   if (!result.passed) {
     core.setFailed(
