@@ -103,11 +103,18 @@ async function run(): Promise<void> {
 
   const client = new ComplianceApiClient(inputs.apiUrl, inputs.apiKey);
 
+  // Extract the PR author (the user who opened the pull request)
+  const prAuthor = context.payload.pull_request?.user?.login as string | undefined;
+  if (prAuthor) {
+    core.info(`PR author: ${prAuthor}`);
+  }
+
   const result = await client.validate(files, {
     frameworks: inputs.frameworks.length > 0 ? inputs.frameworks : undefined,
     severityThreshold: inputs.severityThreshold,
     failOn: inputs.failOn.length > 0 ? inputs.failOn : undefined,
     excludeAcceptedRisk: inputs.excludeAcceptedRisk,
+    actor: prAuthor,
   });
 
   core.info(

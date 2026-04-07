@@ -30517,6 +30517,9 @@ class ComplianceApiClient {
         if (options?.frameworks && options.frameworks.length > 0) {
             body.frameworks = options.frameworks;
         }
+        if (options?.actor) {
+            body.actor = options.actor;
+        }
         if (options?.severityThreshold || options?.failOn || options?.excludeAcceptedRisk !== undefined) {
             body.options = {
                 severity_threshold: options.severityThreshold,
@@ -30972,11 +30975,17 @@ async function run() {
     core.info(`Scanning ${files.length} file(s)...`);
     // ── 3. Call ProdCycle API ──
     const client = new api_client_1.ComplianceApiClient(inputs.apiUrl, inputs.apiKey);
+    // Extract the PR author (the user who opened the pull request)
+    const prAuthor = context.payload.pull_request?.user?.login;
+    if (prAuthor) {
+        core.info(`PR author: ${prAuthor}`);
+    }
     const result = await client.validate(files, {
         frameworks: inputs.frameworks.length > 0 ? inputs.frameworks : undefined,
         severityThreshold: inputs.severityThreshold,
         failOn: inputs.failOn.length > 0 ? inputs.failOn : undefined,
         excludeAcceptedRisk: inputs.excludeAcceptedRisk,
+        actor: prAuthor,
     });
     core.info(`Scan complete: ${result.passed ? "PASSED" : "FAILED"} with ${result.findingsCount} finding(s)`);
     // ── 4. Set outputs ──

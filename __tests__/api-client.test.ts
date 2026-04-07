@@ -64,6 +64,75 @@ describe("ComplianceApiClient", () => {
     expect(body.frameworks).toEqual(["soc2"]);
   });
 
+  it("includes actor in request body when provided", async () => {
+    const mockResponse = {
+      status: "success",
+      statusCode: 200,
+      data: {
+        passed: true,
+        findingsCount: 0,
+        findings: [],
+        summary: {
+          total: 0,
+          passed: 0,
+          failed: 0,
+          bySeverity: {},
+          byFramework: {},
+        },
+        scanId: "scan-actor",
+      },
+    };
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce({
+      ok: true,
+      json: async () => mockResponse,
+    } as Response);
+
+    const client = new ComplianceApiClient(mockApiUrl, mockApiKey);
+    await client.validate(
+      [{ path: "main.tf", content: "" }],
+      { actor: "octocat" },
+    );
+
+    const body = JSON.parse(
+      (fetchSpy.mock.calls[0][1] as RequestInit).body as string,
+    );
+    expect(body.actor).toBe("octocat");
+  });
+
+  it("omits actor from request body when not provided", async () => {
+    const mockResponse = {
+      status: "success",
+      statusCode: 200,
+      data: {
+        passed: true,
+        findingsCount: 0,
+        findings: [],
+        summary: {
+          total: 0,
+          passed: 0,
+          failed: 0,
+          bySeverity: {},
+          byFramework: {},
+        },
+        scanId: "scan-no-actor",
+      },
+    };
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce({
+      ok: true,
+      json: async () => mockResponse,
+    } as Response);
+
+    const client = new ComplianceApiClient(mockApiUrl, mockApiKey);
+    await client.validate([{ path: "main.tf", content: "" }]);
+
+    const body = JSON.parse(
+      (fetchSpy.mock.calls[0][1] as RequestInit).body as string,
+    );
+    expect(body.actor).toBeUndefined();
+  });
+
   it("omits frameworks when not specified", async () => {
     const mockResponse = {
       status: "success",
