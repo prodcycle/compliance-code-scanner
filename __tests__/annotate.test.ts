@@ -18,6 +18,7 @@ vi.mock("@actions/core", () => ({
 
 // Mock @actions/github
 const mockCreateReview = vi.fn();
+const mockCreateReviewComment = vi.fn();
 const mockListFiles = vi.fn().mockResolvedValue({
   data: [
     {
@@ -58,7 +59,7 @@ vi.mock("@actions/github", () => ({
   },
   getOctokit: vi.fn(() => ({
     rest: {
-      pulls: { createReview: mockCreateReview, listFiles: mockListFiles },
+      pulls: { createReview: mockCreateReview, createReviewComment: mockCreateReviewComment, listFiles: mockListFiles },
       issues: {
         listComments: mockListComments,
         createComment: mockCreateComment,
@@ -241,10 +242,11 @@ describe("annotate", () => {
       const { postReviewComments } = await import("../src/annotate");
 
       mockCreateReview.mockRejectedValue(new Error("Validation Failed"));
+      mockCreateReviewComment.mockRejectedValue(new Error("Line could not be resolved"));
       await postReviewComments([makeFinding()], false);
 
       expect(core.warning).toHaveBeenCalledWith(
-        expect.stringContaining("Failed to post PR review"),
+        expect.stringContaining("Batch review failed"),
       );
     });
 
@@ -272,6 +274,36 @@ describe("annotate", () => {
       expect(mockCreateReview).not.toHaveBeenCalled();
       expect(core.info).toHaveBeenCalledWith(
         expect.stringContaining("outside the PR diff"),
+      );
+    });
+
+    it("falls back to individual comments when batch review fails", async () => {
+      const { postReviewComments } = await import("../src/annotate");
+
+      const findings = [
+        makeFinding({ startLine: 10, endLine: 15 }),
+        makeFinding({
+          ruleId: "SOC2-CC6.1",
+          severity: "medium",
+          resourcePath: "src/db.ts",
+          startLine: 20,
+          endLine: 20,
+          message: "Unencrypted database connection",
+        }),
+      ];
+
+      mockCreateReview.mockRejectedValue(new Error("Unprocessable Entity"));
+      // First individual comment succeeds, second fails
+      mockCreateReviewComment
+        .mockResolvedValueOnce({ data: {} })
+        .mockRejectedValueOnce(new Error("Line could not be resolved"));
+
+      await postReviewComments(findings, false);
+
+      expect(mockCreateReview).toHaveBeenCalledOnce();
+      expect(mockCreateReviewComment).toHaveBeenCalledTimes(2);
+      expect(core.info).toHaveBeenCalledWith(
+        expect.stringContaining("Posted 1 of 2 inline comment(s) individually"),
       );
     });
 

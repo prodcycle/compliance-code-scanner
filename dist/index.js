@@ -30190,6 +30190,7 @@ async function postReviewComments(findings, passed) {
             path: f.resourcePath,
             body,
             line: f.endLine,
+            side: "RIGHT",
         };
         // Use multi-line comment if both start and end fall within the same hunk.
         // GitHub requires both endpoints in the same hunk or the review is rejected.
@@ -30200,6 +30201,7 @@ async function postReviewComments(findings, passed) {
                 f.endLine <= range.end);
             if (sharedHunk) {
                 comment.start_line = f.startLine;
+                comment.start_side = "RIGHT";
             }
         }
         comments.push(comment);
@@ -30215,6 +30217,10 @@ async function postReviewComments(findings, passed) {
     const reviewBody = passed
         ? "✅ **ProdCycle Compliance Scan** — findings detected but within acceptable thresholds."
         : "❌ **ProdCycle Compliance Scan** — compliance violations found that require attention.";
+    core.debug(`Attempting to post review with ${comments.length} comment(s) on commit ${commitSha}`);
+    for (const c of comments) {
+        core.debug(`  - ${c.path}:${c.start_line ?? c.line}-${c.line}`);
+    }
     try {
         await octokit.rest.pulls.createReview({
             owner,
@@ -30228,9 +30234,36 @@ async function postReviewComments(findings, passed) {
         core.info(`Posted PR review with ${comments.length} inline comment(s).`);
     }
     catch (err) {
-        // If the review still fails, fall back gracefully — the summary
-        // comment and annotations are still posted.
-        core.warning(`Failed to post PR review: ${err instanceof Error ? err.message : String(err)}`);
+        core.warning(`Batch review failed: ${err instanceof Error ? err.message : String(err)}. Falling back to individual comments.`);
+        // Fall back: post each comment individually, skipping those that
+        // GitHub rejects (e.g. lines outside the diff).
+        let posted = 0;
+        for (const comment of comments) {
+            try {
+                await octokit.rest.pulls.createReviewComment({
+                    owner,
+                    repo,
+                    pull_number: prNumber,
+                    commit_id: commitSha,
+                    path: comment.path,
+                    body: comment.body,
+                    line: comment.line,
+                    ...(comment.start_line ? { start_line: comment.start_line } : {}),
+                    side: "RIGHT",
+                    ...(comment.start_line ? { start_side: "RIGHT" } : {}),
+                });
+                posted++;
+            }
+            catch (commentErr) {
+                core.debug(`Skipped comment on ${comment.path}:${comment.line}: ${commentErr instanceof Error ? commentErr.message : String(commentErr)}`);
+            }
+        }
+        if (posted > 0) {
+            core.info(`Posted ${posted} of ${comments.length} inline comment(s) individually.`);
+        }
+        else {
+            core.info("No inline comments could be posted (findings are on lines outside the PR diff).");
+        }
     }
 }
 /**
