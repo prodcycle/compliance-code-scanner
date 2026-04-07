@@ -36,3 +36,22 @@ jobs:
             git diff --stat dist/
             exit 1
           fi
+
+  # Self-test: run the action on its own PRs to verify it works end-to-end
+  compliance-scan:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Compliance Scanner
+        uses: ./
+        with:
+          api-key: ${{ secrets.PRODCYCLE_API_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fail-on: critical
