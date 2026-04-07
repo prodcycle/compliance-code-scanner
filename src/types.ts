@@ -27,6 +27,8 @@ export interface ChangedFile {
 export interface ValidateRequest {
   files: Record<string, string>;
   frameworks?: string[];
+  /** GitHub username of the user who opened the PR */
+  actor?: string;
   options?: {
     severity_threshold?: string;
     fail_on?: string[];

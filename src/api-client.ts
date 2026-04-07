@@ -45,6 +45,7 @@ export class ComplianceApiClient {
       severityThreshold?: string;
       failOn?: string[];
       excludeAcceptedRisk?: boolean;
+      actor?: string;
     },
   ): Promise<ValidateResponse> {
     const batches = createBatches(files);
@@ -85,6 +86,7 @@ export class ComplianceApiClient {
       severityThreshold?: string;
       failOn?: string[];
       excludeAcceptedRisk?: boolean;
+      actor?: string;
     },
   ): Promise<ValidateResponse> {
     // Use a queue so batches can be split further on 413
@@ -130,6 +132,7 @@ export class ComplianceApiClient {
       severityThreshold?: string;
       failOn?: string[];
       excludeAcceptedRisk?: boolean;
+      actor?: string;
     },
   ): Promise<ValidateResponse> {
     const filesMap: Record<string, string> = {};
@@ -143,6 +146,10 @@ export class ComplianceApiClient {
 
     if (options?.frameworks && options.frameworks.length > 0) {
       body.frameworks = options.frameworks;
+    }
+
+    if (options?.actor) {
+      body.actor = options.actor;
     }
 
     if (options?.severityThreshold || options?.failOn || options?.excludeAcceptedRisk !== undefined) {
