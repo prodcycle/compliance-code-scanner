@@ -18,9 +18,32 @@ vi.mock("@actions/core", () => ({
 
 // Mock @actions/github
 const mockCreateReview = vi.fn();
+const mockListFiles = vi.fn().mockResolvedValue({
+  data: [
+    {
+      filename: "src/auth.ts",
+      patch: "@@ -5,20 +5,25 @@\n some diff content",
+    },
+    {
+      filename: "src/db.ts",
+      patch: "@@ -18,5 +18,8 @@\n some diff content",
+    },
+  ],
+});
 const mockListComments = vi.fn().mockResolvedValue({ data: [] });
 const mockCreateComment = vi.fn();
 const mockUpdateComment = vi.fn();
+
+const mockPaginate = vi.fn().mockResolvedValue([
+  {
+    filename: "src/auth.ts",
+    patch: "@@ -5,20 +5,25 @@\n some diff content",
+  },
+  {
+    filename: "src/db.ts",
+    patch: "@@ -18,5 +18,8 @@\n some diff content",
+  },
+]);
 
 vi.mock("@actions/github", () => ({
   context: {
@@ -35,13 +58,14 @@ vi.mock("@actions/github", () => ({
   },
   getOctokit: vi.fn(() => ({
     rest: {
-      pulls: { createReview: mockCreateReview },
+      pulls: { createReview: mockCreateReview, listFiles: mockListFiles },
       issues: {
         listComments: mockListComments,
         createComment: mockCreateComment,
         updateComment: mockUpdateComment,
       },
     },
+    paginate: mockPaginate,
   })),
 }));
 
@@ -63,6 +87,38 @@ function makeFinding(overrides: Partial<ScanFinding> = {}): ScanFinding {
     ...overrides,
   };
 }
+
+describe("parseDiffHunks", () => {
+  it("extracts line ranges from unified diff patch", async () => {
+    const { parseDiffHunks } = await import("../src/annotate");
+
+    const patch = [
+      "@@ -10,5 +10,8 @@ some context",
+      " unchanged line",
+      "+added line",
+      "@@ -50,3 +53,6 @@ more context",
+      "+another addition",
+    ].join("\n");
+
+    const ranges = parseDiffHunks(patch);
+    expect(ranges).toEqual([
+      { start: 10, end: 17 },
+      { start: 53, end: 58 },
+    ]);
+  });
+
+  it("handles single-line hunks without count", async () => {
+    const { parseDiffHunks } = await import("../src/annotate");
+    const patch = "@@ -1 +1 @@\n-old\n+new";
+    const ranges = parseDiffHunks(patch);
+    expect(ranges).toEqual([{ start: 1, end: 1 }]);
+  });
+
+  it("returns empty array for empty patch", async () => {
+    const { parseDiffHunks } = await import("../src/annotate");
+    expect(parseDiffHunks("")).toEqual([]);
+  });
+});
 
 describe("annotate", () => {
   beforeEach(() => {
@@ -102,7 +158,7 @@ describe("annotate", () => {
   });
 
   describe("postReviewComments", () => {
-    it("posts a PR review with inline comments for findings with line info", async () => {
+    it("posts a PR review with inline comments for findings within the diff", async () => {
       const { postReviewComments } = await import("../src/annotate");
 
       const findings = [
@@ -120,6 +176,7 @@ describe("annotate", () => {
       mockCreateReview.mockResolvedValue({ data: {} });
       await postReviewComments(findings, false);
 
+      expect(mockPaginate).toHaveBeenCalledOnce();
       expect(mockCreateReview).toHaveBeenCalledOnce();
       const call = mockCreateReview.mock.calls[0][0];
 
@@ -202,6 +259,30 @@ describe("annotate", () => {
       expect(body).toContain("[CRITICAL]");
       expect(body).toContain("Remediation:");
       expect(body).toContain("AES-256");
+    });
+
+    it("skips findings outside the PR diff", async () => {
+      const { postReviewComments } = await import("../src/annotate");
+
+      // Finding on line 100 — well outside the diff range (5-29)
+      const findings = [makeFinding({ startLine: 100, endLine: 105 })];
+      mockCreateReview.mockResolvedValue({ data: {} });
+      await postReviewComments(findings, false);
+
+      expect(mockCreateReview).not.toHaveBeenCalled();
+      expect(core.info).toHaveBeenCalledWith(
+        expect.stringContaining("outside the PR diff"),
+      );
+    });
+
+    it("skips findings for files not in the PR diff", async () => {
+      const { postReviewComments } = await import("../src/annotate");
+
+      const findings = [makeFinding({ resourcePath: "src/unknown.ts", startLine: 5, endLine: 10 })];
+      mockCreateReview.mockResolvedValue({ data: {} });
+      await postReviewComments(findings, false);
+
+      expect(mockCreateReview).not.toHaveBeenCalled();
     });
   });
 });

@@ -239,7 +239,29 @@ export async function postReviewComments(
     return;
   }
 
-  const comments = reviewableFindings.map((f) => {
+  // Fetch the PR diff ranges so we only comment on lines within the diff.
+  // GitHub rejects review comments on lines outside the diff with 422.
+  const diffRanges = await fetchDiffRanges(octokit, owner, repo, prNumber);
+
+  const comments: ReviewComment[] = [];
+  let outsideDiffCount = 0;
+
+  for (const f of reviewableFindings) {
+    const fileRanges = diffRanges.get(f.resourcePath);
+    if (!fileRanges) {
+      outsideDiffCount++;
+      continue;
+    }
+
+    // Check if the finding's end line falls within a diff hunk
+    const inDiff = fileRanges.some(
+      (range) => f.endLine >= range.start && f.endLine <= range.end,
+    );
+    if (!inDiff) {
+      outsideDiffCount++;
+      continue;
+    }
+
     const icon = SEVERITY_ICONS[f.severity] || "";
     const body = [
       `${icon} **[${f.severity.toUpperCase()}] ${f.ruleId}**`,
@@ -257,13 +279,34 @@ export async function postReviewComments(
       line: f.endLine,
     };
 
-    // Use multi-line comment if the finding spans more than one line
+    // Use multi-line comment if both start and end fall within the same hunk.
+    // GitHub requires both endpoints in the same hunk or the review is rejected.
     if (f.startLine > 0 && f.startLine < f.endLine) {
-      comment.start_line = f.startLine;
+      const sharedHunk = fileRanges.find(
+        (range) =>
+          f.startLine >= range.start &&
+          f.startLine <= range.end &&
+          f.endLine >= range.start &&
+          f.endLine <= range.end,
+      );
+      if (sharedHunk) {
+        comment.start_line = f.startLine;
+      }
     }
 
-    return comment;
-  });
+    comments.push(comment);
+  }
+
+  if (outsideDiffCount > 0) {
+    core.info(
+      `${outsideDiffCount} finding(s) are outside the PR diff and will not appear as inline comments.`,
+    );
+  }
+
+  if (comments.length === 0) {
+    core.info("No findings fall within the PR diff. Skipping inline review.");
+    return;
+  }
 
   const event = passed ? "COMMENT" : "REQUEST_CHANGES";
   const reviewBody = passed
@@ -284,8 +327,8 @@ export async function postReviewComments(
       `Posted PR review with ${comments.length} inline comment(s).`,
     );
   } catch (err) {
-    // If the review fails (e.g., lines are outside the diff), fall back
-    // gracefully — the summary comment and annotations are still posted.
+    // If the review still fails, fall back gracefully — the summary
+    // comment and annotations are still posted.
     core.warning(
       `Failed to post PR review: ${err instanceof Error ? err.message : String(err)}`,
     );
@@ -298,6 +341,69 @@ interface ReviewComment {
   body: string;
   line: number;
   start_line?: number;
+}
+
+/** A range of lines in the "new" side of a diff hunk */
+interface DiffRange {
+  start: number;
+  end: number;
+}
+
+/**
+ * Fetch the list of files changed in a PR and parse their diff hunks
+ * into line ranges on the "new" (right) side. Only lines within these
+ * ranges can be targeted by `pulls.createReview` comments.
+ */
+async function fetchDiffRanges(
+  octokit: ReturnType<typeof github.getOctokit>,
+  owner: string,
+  repo: string,
+  prNumber: number,
+): Promise<Map<string, DiffRange[]>> {
+  const ranges = new Map<string, DiffRange[]>();
+
+  try {
+    const files = await octokit.paginate(octokit.rest.pulls.listFiles, {
+      owner,
+      repo,
+      pull_number: prNumber,
+      per_page: 100,
+    });
+
+    for (const file of files) {
+      if (!file.patch) continue;
+      const fileRanges = parseDiffHunks(file.patch);
+      if (fileRanges.length > 0) {
+        ranges.set(file.filename, fileRanges);
+      }
+    }
+  } catch (err) {
+    core.warning(
+      `Failed to fetch PR diff ranges: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  return ranges;
+}
+
+/**
+ * Parse unified diff patch text to extract line ranges on the new (right) side.
+ * Hunk headers look like: @@ -oldStart,oldCount +newStart,newCount @@
+ */
+export function parseDiffHunks(patch: string): DiffRange[] {
+  const ranges: DiffRange[] = [];
+  const hunkHeaderRe = /^@@\s+-\d+(?:,\d+)?\s+\+(\d+)(?:,(\d+))?\s+@@/gm;
+  let match: RegExpExecArray | null;
+
+  while ((match = hunkHeaderRe.exec(patch)) !== null) {
+    const start = parseInt(match[1], 10);
+    const count = match[2] !== undefined ? parseInt(match[2], 10) : 1;
+    if (count > 0) {
+      ranges.push({ start, end: start + count - 1 });
+    }
+  }
+
+  return ranges;
 }
 
 /**
