@@ -219,10 +219,13 @@ export async function postReviewComments(
 
   // Only post review comments for findings that have line information
   const reviewableFindings = findings.filter((f) => f.startLine > 0 && f.endLine > 0);
-  if (reviewableFindings.length === 0) {
+  const skippedCount = findings.length - reviewableFindings.length;
+  if (skippedCount > 0) {
     core.info(
-      `${findings.length} finding(s) lack line information (startLine/endLine). Skipping inline PR review comments.`,
+      `${skippedCount} finding(s) lack line information (startLine/endLine). They will not appear as inline comments.`,
     );
+  }
+  if (reviewableFindings.length === 0) {
     return;
   }
 
