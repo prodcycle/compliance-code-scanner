@@ -30953,10 +30953,11 @@ async function ensureBaseSha(baseSha) {
     }
 }
 /**
- * Collect changed files for the PR in diff mode.
- * Only the unified diff is sent to the API (not full file contents).
+ * Collect changed files for the PR with their diffs.
+ * Sends full file content AND the unified diff so the API can scope
+ * its analysis to the changed lines while still having full context.
  */
-async function collectChangedFiles(baseSha, headSha, repoRoot, include, exclude, mode = "diff") {
+async function collectChangedFiles(baseSha, headSha, repoRoot, include, exclude) {
     await ensureBaseSha(baseSha);
     const changedPaths = await getChangedFilePaths(baseSha, headSha);
     core.info(`Found ${changedPaths.length} changed file(s) in PR`);
@@ -30967,20 +30968,17 @@ async function collectChangedFiles(baseSha, headSha, repoRoot, include, exclude,
     if (filteredPaths.length === 0) {
         return [];
     }
-    if (mode === "diff") {
-        // Diff mode: send only the unified diff for each file
-        const diffMap = await getFileDiffs(baseSha, headSha, filteredPaths);
-        const files = [];
-        for (const filePath of filteredPaths) {
-            const diff = diffMap.get(filePath);
-            if (diff) {
-                files.push({ path: filePath, content: "", diff });
-            }
+    // Read full file contents (for context) and attach diffs
+    const baseFiles = readFileContents(filteredPaths, repoRoot);
+    const diffMap = await getFileDiffs(baseSha, headSha, filteredPaths);
+    // Attach diffs to the files that have them
+    for (const file of baseFiles) {
+        const diff = diffMap.get(file.path);
+        if (diff) {
+            file.diff = diff;
         }
-        return files;
     }
-    // Full mode on PR: read full file contents for changed files
-    return readFileContents(filteredPaths, repoRoot);
+    return baseFiles;
 }
 /**
  * Collect ALL files in the repository for a full codebase scan.
@@ -31121,7 +31119,7 @@ async function run() {
                 process.env.GITHUB_SHA ||
                 "HEAD";
             core.info(`Diff scan: ${baseSha.substring(0, 8)} -> ${headSha.substring(0, 8)}`);
-            files = await (0, diff_1.collectChangedFiles)(baseSha, headSha, repoRoot, inputs.include, inputs.exclude, "diff");
+            files = await (0, diff_1.collectChangedFiles)(baseSha, headSha, repoRoot, inputs.include, inputs.exclude);
         }
     }
     if (files.length === 0) {

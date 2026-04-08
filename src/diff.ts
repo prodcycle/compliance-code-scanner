@@ -181,8 +181,9 @@ async function ensureBaseSha(baseSha: string): Promise<void> {
 }
 
 /**
- * Collect changed files for the PR in diff mode.
- * Only the unified diff is sent to the API (not full file contents).
+ * Collect changed files for the PR with their diffs.
+ * Sends full file content AND the unified diff so the API can scope
+ * its analysis to the changed lines while still having full context.
  */
 export async function collectChangedFiles(
   baseSha: string,
@@ -190,7 +191,6 @@ export async function collectChangedFiles(
   repoRoot: string,
   include: string[],
   exclude: string[],
-  mode: "diff" | "full" = "diff",
 ): Promise<ChangedFile[]> {
   await ensureBaseSha(baseSha);
 
@@ -206,23 +206,19 @@ export async function collectChangedFiles(
     return [];
   }
 
-  if (mode === "diff") {
-    // Diff mode: send only the unified diff for each file
-    const diffMap = await getFileDiffs(baseSha, headSha, filteredPaths);
-    const files: ChangedFile[] = [];
+  // Read full file contents (for context) and attach diffs
+  const baseFiles = readFileContents(filteredPaths, repoRoot);
+  const diffMap = await getFileDiffs(baseSha, headSha, filteredPaths);
 
-    for (const filePath of filteredPaths) {
-      const diff = diffMap.get(filePath);
-      if (diff) {
-        files.push({ path: filePath, content: "", diff });
-      }
+  // Attach diffs to the files that have them
+  for (const file of baseFiles) {
+    const diff = diffMap.get(file.path);
+    if (diff) {
+      file.diff = diff;
     }
-
-    return files;
   }
 
-  // Full mode on PR: read full file contents for changed files
-  return readFileContents(filteredPaths, repoRoot);
+  return baseFiles;
 }
 
 /**

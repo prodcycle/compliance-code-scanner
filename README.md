@@ -8,11 +8,13 @@ A GitHub Action that scans pull request changes for compliance violations agains
 
 On every pull request:
 
-1. Collects changed files from the PR diff (full file content, not just the diff)
+1. Collects the **diffs** of changed files from the PR (only the changed lines are analyzed by default)
 2. Sends them to the ProdCycle compliance check API
 3. Creates inline annotations on the PR for each finding
 4. Posts a summary comment with severity and framework breakdown
 5. Fails the check if findings match the configured severity threshold
+
+You can also run a **full codebase scan** (e.g. on merge to `main`) by setting `scan-mode: full`.
 
 ## Quick start
 
@@ -71,6 +73,7 @@ Create `.github/workflows/compliance.yml` in your repository with the configurat
 | `severity-threshold` | No       | `low`                       | Minimum severity to include in results                                   |
 | `include`            | No       | All changed files           | Comma-separated glob patterns to include (`**/*.tf,**/*.yaml`)           |
 | `exclude`            | No       | None                        | Comma-separated glob patterns to exclude (`test/**,docs/**`)             |
+| `scan-mode`          | No       | `diff`                      | `diff` scans only changed lines (default for PRs); `full` scans the entire codebase |
 | `annotate`           | No       | `true`                      | Create inline PR annotations for findings                                |
 | `comment`            | No       | `true`                      | Post a summary comment on the PR                                         |
 
@@ -126,6 +129,30 @@ Create `.github/workflows/compliance.yml` in your repository with the configurat
     echo "Passed: ${{ steps.compliance.outputs.passed }}"
     echo "Findings: ${{ steps.compliance.outputs.findings-count }}"
     echo "Scan: ${{ steps.compliance.outputs.scan-id }}"
+```
+
+### Full codebase scan on merge
+
+Run a comprehensive scan of the entire codebase after code is merged:
+
+```yaml
+# .github/workflows/compliance-full.yml
+name: Full Compliance Scan
+on:
+  push:
+    branches: [main]
+
+jobs:
+  compliance:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: prodcycle/compliance-code-scanner@v1
+        with:
+          api-key: ${{ secrets.PRODCYCLE_API_KEY }}
+          scan-mode: full
 ```
 
 ### Self-hosted ProdCycle instance

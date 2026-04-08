@@ -1,5 +1,8 @@
-import { describe, it, expect } from "vitest";
-import { filterPaths } from "../src/diff";
+import { describe, it, expect, beforeEach } from "vitest";
+import { filterPaths, readFileContents } from "../src/diff";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 describe("filterPaths", () => {
   const paths = [
@@ -54,5 +57,48 @@ describe("filterPaths", () => {
   it("returns empty array when include matches nothing", () => {
     const result = filterPaths(paths, ["**/*.go"], []);
     expect(result).toEqual([]);
+  });
+});
+
+describe("readFileContents", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "diff-test-"));
+  });
+
+  it("reads file contents from disk", () => {
+    fs.writeFileSync(path.join(tmpDir, "a.ts"), "const a = 1;");
+    fs.writeFileSync(path.join(tmpDir, "b.ts"), "const b = 2;");
+
+    const result = readFileContents(["a.ts", "b.ts"], tmpDir);
+    expect(result).toEqual([
+      { path: "a.ts", content: "const a = 1;" },
+      { path: "b.ts", content: "const b = 2;" },
+    ]);
+  });
+
+  it("skips files larger than 512 KB", () => {
+    fs.writeFileSync(path.join(tmpDir, "big.ts"), "x".repeat(513 * 1024));
+    fs.writeFileSync(path.join(tmpDir, "small.ts"), "ok");
+
+    const result = readFileContents(["big.ts", "small.ts"], tmpDir);
+    expect(result).toEqual([{ path: "small.ts", content: "ok" }]);
+  });
+
+  it("skips unreadable files", () => {
+    const result = readFileContents(["nonexistent.ts"], tmpDir);
+    expect(result).toEqual([]);
+  });
+
+  it("enforces the 500 file cap", () => {
+    // Create 502 files
+    for (let i = 0; i < 502; i++) {
+      fs.writeFileSync(path.join(tmpDir, `f${i}.ts`), `file ${i}`);
+    }
+    const paths = Array.from({ length: 502 }, (_, i) => `f${i}.ts`);
+
+    const result = readFileContents(paths, tmpDir);
+    expect(result.length).toBe(500);
   });
 });

@@ -92,7 +92,6 @@ async function run(): Promise<void> {
         repoRoot,
         inputs.include,
         inputs.exclude,
-        "diff",
       );
     }
   }
