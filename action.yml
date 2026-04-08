@@ -42,9 +42,9 @@ inputs:
     required: false
     default: "true"
   scan-mode:
-    description: "Scan mode: 'diff' scans only the changed lines (default for PRs), 'full' scans the entire codebase."
+    description: "Scan mode: 'auto' (diff for PRs, full for pushes), 'diff' (only changed lines), 'full' (entire codebase)."
     required: false
-    default: "diff"
+    default: "auto"
   exclude-accepted-risk:
     description: "Skip findings that have been marked as accepted risk in the ProdCycle platform."
     required: false

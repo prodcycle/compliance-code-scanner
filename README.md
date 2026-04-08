@@ -6,23 +6,35 @@ A GitHub Action that scans pull request changes for compliance violations agains
 
 ## How it works
 
-On every pull request:
+The action supports two modes (managed automatically by default):
 
-1. Collects the **diffs** of changed files from the PR (only the changed lines are analyzed by default)
-2. Sends them to the ProdCycle compliance check API
-3. Creates inline annotations on the PR for each finding
-4. Posts a summary comment with severity and framework breakdown
-5. Fails the check if findings match the configured severity threshold
+**1. Pull Request mode (diff scan)**
+When run on a `pull_request` event:
+- Collects the **diffs** of changed files from the PR (only the changed lines are analyzed)
+- Sends them to the ProdCycle compliance check API
+- Creates inline annotations on the PR for each finding
+- Posts a summary comment with severity and framework breakdown
+- Fails the check if findings match the configured severity threshold
 
-You can also run a **full codebase scan** (e.g. on merge to `main`) by setting `scan-mode: full`.
+**2. Push / Merge mode (full scan)**
+When run on a `push` event (e.g., merge to `main`):
+- Collects and scans the **entire codebase**
+- Validates all tracked files against compliance frameworks
+- Reports any findings in the GitHub Actions summary
 
 ## Quick start
+
+Add the following workflow to automatically scan both pull requests and merges to your default branch:
 
 ```yaml
 # .github/workflows/compliance.yml
 name: Compliance Code Scanner
 on:
   pull_request:
+  push:
+    branches:
+      - main
+      - master
 
 jobs:
   compliance:
@@ -73,7 +85,7 @@ Create `.github/workflows/compliance.yml` in your repository with the configurat
 | `severity-threshold` | No       | `low`                       | Minimum severity to include in results                                   |
 | `include`            | No       | All changed files           | Comma-separated glob patterns to include (`**/*.tf,**/*.yaml`)           |
 | `exclude`            | No       | None                        | Comma-separated glob patterns to exclude (`test/**,docs/**`)             |
-| `scan-mode`          | No       | `diff`                      | `diff` scans only changed lines (default for PRs); `full` scans the entire codebase |
+| `scan-mode`          | No       | `auto`                      | `auto` (diff for PRs, full for pushes); `diff` (changed lines only); `full` (entire codebase) |
 | `annotate`           | No       | `true`                      | Create inline PR annotations for findings                                |
 | `comment`            | No       | `true`                      | Post a summary comment on the PR                                         |
 
@@ -131,28 +143,15 @@ Create `.github/workflows/compliance.yml` in your repository with the configurat
     echo "Scan: ${{ steps.compliance.outputs.scan-id }}"
 ```
 
-### Full codebase scan on merge
+### Explicit full codebase scan
 
-Run a comprehensive scan of the entire codebase after code is merged:
+If you want to force a comprehensive scan of the entire codebase regardless of the event trigger, you can explicitly set `scan-mode: full`:
 
 ```yaml
-# .github/workflows/compliance-full.yml
-name: Full Compliance Scan
-on:
-  push:
-    branches: [main]
-
-jobs:
-  compliance:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - uses: prodcycle/compliance-code-scanner@v1
-        with:
-          api-key: ${{ secrets.PRODCYCLE_API_KEY }}
-          scan-mode: full
+- uses: prodcycle/compliance-code-scanner@v1
+  with:
+    api-key: ${{ secrets.PRODCYCLE_API_KEY }}
+    scan-mode: full
 ```
 
 ### Self-hosted ProdCycle instance

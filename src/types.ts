@@ -11,7 +11,7 @@ export interface ActionInputs {
   severityThreshold: string;
   include: string[];
   exclude: string[];
-  scanMode: "diff" | "full";
+  scanMode: "auto" | "diff" | "full";
   annotate: boolean;
   comment: boolean;
   excludeAcceptedRisk: boolean;

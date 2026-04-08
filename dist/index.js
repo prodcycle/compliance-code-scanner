@@ -31159,7 +31159,7 @@ function parseInputs() {
         severityThreshold: core.getInput("severity-threshold") || "low",
         include: parseCommaSeparated(core.getInput("include")),
         exclude: parseCommaSeparated(core.getInput("exclude")),
-        scanMode: (core.getInput("scan-mode") || "diff"),
+        scanMode: (core.getInput("scan-mode") || "auto"),
         annotate: core.getBooleanInput("annotate"),
         comment: core.getBooleanInput("comment"),
         excludeAcceptedRisk: core.getBooleanInput("exclude-accepted-risk"),
@@ -31186,8 +31186,24 @@ async function run() {
         core.info("Running full codebase scan...");
         files = await (0, diff_1.collectAllFiles)(repoRoot, inputs.include, inputs.exclude);
     }
+    else if (inputs.scanMode === "auto") {
+        // Auto mode — diff scan for PRs, full scan for pushes
+        if (context.payload.pull_request) {
+            core.info("Auto mode: PR detected, running diff scan...");
+            const baseSha = context.payload.pull_request.base?.sha || "HEAD~1";
+            const headSha = context.payload.pull_request.head?.sha ||
+                process.env.GITHUB_SHA ||
+                "HEAD";
+            core.info(`Diff scan: ${baseSha.substring(0, 8)} -> ${headSha.substring(0, 8)}`);
+            files = await (0, diff_1.collectChangedFiles)(baseSha, headSha, repoRoot, inputs.include, inputs.exclude);
+        }
+        else {
+            core.info("Auto mode: No PR detected, running full codebase scan...");
+            files = await (0, diff_1.collectAllFiles)(repoRoot, inputs.include, inputs.exclude);
+        }
+    }
     else {
-        // Diff mode (default) — only scan the diffs from the PR
+        // Diff mode (explicitly requested) — only scan the diffs from the PR
         if (!context.payload.pull_request) {
             core.info("Not a pull request event. Falling back to full codebase scan.");
             files = await (0, diff_1.collectAllFiles)(repoRoot, inputs.include, inputs.exclude);
@@ -31227,7 +31243,7 @@ async function run() {
     // In diff mode, filter out findings on lines outside the PR diff.
     // The API scans full file contents for context but we only surface
     // findings on lines the PR actually changed.
-    if (inputs.scanMode === "diff" && context.payload.pull_request) {
+    if ((inputs.scanMode === "diff" || inputs.scanMode === "auto") && context.payload.pull_request) {
         result = (0, diff_1.filterFindingsToDiff)(result, files, inputs.failOn);
     }
     core.info(`Scan complete: ${result.passed ? "PASSED" : "FAILED"} with ${result.findingsCount} finding(s)`);
