@@ -390,6 +390,61 @@ describe("annotate", () => {
       );
     });
 
+    it("embeds a stable rule marker that the dedup extractor can read back", async () => {
+      const { postReviewComments, extractRuleIdFromBody } = await import("../src/annotate");
+
+      mockPaginate.mockImplementation((endpoint: unknown) => {
+        if (endpoint === mockListReviewComments) return Promise.resolve([]);
+        return Promise.resolve(diffFiles);
+      });
+
+      mockCreateReview.mockResolvedValue({ data: {} });
+      await postReviewComments(
+        [
+          makeFinding({ startLine: 10, endLine: 15 }),
+          makeFinding({
+            ruleId: "SOC2-CC6.1",
+            resourcePath: "src/auth.ts",
+            startLine: 100,
+            endLine: 105,
+          }),
+        ],
+        "REQUEST_CHANGES",
+      );
+
+      const comments = mockCreateReview.mock.calls[0][0].comments;
+      // Inline comment round-trips
+      expect(comments[0].body).toContain("<!-- prodcycle-rule:HIPAA-164.312-a1 -->");
+      expect(extractRuleIdFromBody(comments[0].body)).toBe("HIPAA-164.312-a1");
+      // File-level comment round-trips
+      expect(comments[1].body).toContain("<!-- prodcycle-rule:SOC2-CC6.1 -->");
+      expect(extractRuleIdFromBody(comments[1].body)).toBe("SOC2-CC6.1");
+    });
+
+    it("dedups via the HTML-comment marker even if the visible header is reworded", async () => {
+      const { postReviewComments } = await import("../src/annotate");
+
+      // Existing comment lacks the legacy `**[HIGH] RULE**` header but carries
+      // the structured marker — dedup must still recognize it.
+      mockPaginate.mockImplementation((endpoint: unknown) => {
+        if (endpoint === mockListReviewComments) {
+          return Promise.resolve([
+            {
+              path: "src/auth.ts",
+              line: 15,
+              body: "<!-- prodcycle-rule:HIPAA-164.312-a1 -->\nCompletely reworded comment body",
+            },
+          ]);
+        }
+        return Promise.resolve(diffFiles);
+      });
+
+      mockCreateReview.mockResolvedValue({ data: {} });
+      await postReviewComments([makeFinding({ startLine: 10, endLine: 15 })], "REQUEST_CHANGES");
+
+      expect(mockCreateReview).not.toHaveBeenCalled();
+    });
+
     it("posts only new comments when some already exist", async () => {
       const { postReviewComments } = await import("../src/annotate");
 
