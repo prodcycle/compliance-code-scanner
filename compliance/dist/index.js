@@ -29967,6 +29967,7 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.createAnnotations = createAnnotations;
 exports.postSummaryComment = postSummaryComment;
 exports.postReviewComments = postReviewComments;
+exports.extractRuleIdFromBody = extractRuleIdFromBody;
 exports.parseDiffHunks = parseDiffHunks;
 exports.writeJobSummary = writeJobSummary;
 const core = __importStar(__nccwpck_require__(6966));
@@ -30186,6 +30187,7 @@ async function postReviewComments(findings, reviewEvent) {
         if (inDiff && fileRanges) {
             // Inline comment on the specific line(s)
             const body = [
+                ruleMarker(f.ruleId),
                 `${icon} **[${f.severity.toUpperCase()}] ${f.ruleId}**`,
                 "",
                 f.message,
@@ -30229,6 +30231,7 @@ async function postReviewComments(findings, reviewEvent) {
                 : `L${f.startLine}`;
             const fileLink = `${repoUrl}/blob/${commitSha}/${f.resourcePath}#${lineFragment}`;
             const body = [
+                ruleMarker(f.ruleId),
                 `${icon} **[${f.severity.toUpperCase()}] ${f.ruleId}** (line ${f.startLine}${f.endLine !== f.startLine ? `–${f.endLine}` : ""}) ([view](${fileLink}))`,
                 "",
                 f.message,
@@ -30334,10 +30337,36 @@ function reviewCommentKey(path, line, ruleId) {
     return `${path}::${line ?? "file"}::${ruleId}`;
 }
 /**
- * Regex to extract the ruleId from a review comment body.
- * Matches the pattern: **[SEVERITY] RULE_ID**
+ * Hidden HTML-comment marker embedded at the top of every review comment
+ * body produced by this action. Stable across body-format changes so dedup
+ * keeps working even if the visible copy is reworded.
+ *
+ * Shape: `<!-- prodcycle-rule:RULE_ID -->`
+ */
+const RULE_MARKER_RE = /<!--\s*prodcycle-rule:(.+?)\s*-->/;
+/**
+ * Legacy extractor for the visible `**[SEVERITY] RULE_ID**` header. Kept as a
+ * back-compat fallback so review comments posted before the marker existed
+ * still dedup correctly on existing open PRs.
  */
 const RULE_ID_RE = /\*\*\[\w+\]\s+(.+?)\*\*/;
+function ruleMarker(ruleId) {
+    return `<!-- prodcycle-rule:${ruleId} -->`;
+}
+/**
+ * Extract the ruleId from a review comment body. Prefers the structured
+ * HTML-comment marker; falls back to parsing the visible header for older
+ * comments posted before the marker was introduced.
+ */
+function extractRuleIdFromBody(body) {
+    if (!body)
+        return undefined;
+    const markerMatch = body.match(RULE_MARKER_RE);
+    if (markerMatch)
+        return markerMatch[1];
+    const legacyMatch = body.match(RULE_ID_RE);
+    return legacyMatch ? legacyMatch[1] : undefined;
+}
 /**
  * Fetch existing review comments on the PR and build a set of dedup keys
  * so we can avoid posting the same comment twice across re-runs.
@@ -30347,10 +30376,9 @@ async function fetchExistingCommentKeys(octokit, owner, repo, prNumber) {
     try {
         const comments = await octokit.paginate(octokit.rest.pulls.listReviewComments, { owner, repo, pull_number: prNumber, per_page: 100 });
         for (const c of comments) {
-            const match = c.body?.match(RULE_ID_RE);
-            if (!match)
+            const ruleId = extractRuleIdFromBody(c.body);
+            if (!ruleId)
                 continue;
-            const ruleId = match[1];
             const line = c.line ?? undefined;
             // c.subject_type === "file" means file-level comment
             const isFileLevel = c.subject_type === "file" || !line;
