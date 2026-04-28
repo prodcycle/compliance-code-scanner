@@ -15,6 +15,21 @@ const MAX_RETRIES = 2;
 const RETRY_DELAY_MS = 2_000;
 
 /**
+ * Hard ceiling on Retry-After honoring. Even if the server (or an
+ * upstream proxy) asks for an absurd interval we cap it so a misbehaving
+ * tier can't wedge the action job for the full GitHub-Actions step
+ * timeout. Configurable via `COMPLIANCE_MAX_RETRY_AFTER_MS` for operators
+ * who want a different ceiling in their CI.
+ */
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+const MAX_RETRY_AFTER_MS = envInt("COMPLIANCE_MAX_RETRY_AFTER_MS", 60_000);
+
+/**
  * Maximum payload size per request in bytes.
  * The API enforces a 5 MB limit; we target 2 MB to leave ample headroom
  * for JSON overhead (keys, brackets, escaping of special characters).
@@ -148,18 +163,23 @@ export class ComplianceApiClient {
     if (options?.actor) {
       body.actor = options.actor;
     }
-    if (
-      options?.severityThreshold ||
-      options?.failOn ||
-      options?.excludeAcceptedRisk !== undefined
-    ) {
-      body.options = {
-        severity_threshold: options.severityThreshold,
-        fail_on: options.failOn,
-        include_prompt: true,
-        exclude_accepted_risk: options.excludeAcceptedRisk,
-      };
+    // Always send `options` with `include_prompt: true` so the chunked
+    // path produces the same response shape (with remediation prompt) as
+    // sync `/validate`. Previously this object was elided when none of
+    // severityThreshold / failOn / excludeAcceptedRisk were set, so a
+    // bare `validate(files)` taking the chunked fallback would silently
+    // omit the prompt.
+    const optionsBody: Record<string, unknown> = { include_prompt: true };
+    if (options?.severityThreshold) {
+      optionsBody.severity_threshold = options.severityThreshold;
     }
+    if (options?.failOn) {
+      optionsBody.fail_on = options.failOn;
+    }
+    if (options?.excludeAcceptedRisk !== undefined) {
+      optionsBody.exclude_accepted_risk = options.excludeAcceptedRisk;
+    }
+    body.options = optionsBody;
     return body;
   }
 
@@ -174,10 +194,17 @@ export class ComplianceApiClient {
   ): Promise<T> {
     const url = `${this.apiUrl.replace(/\/+$/, "")}${endpoint}`;
     let lastError: Error | undefined;
+    // Delay BEFORE the next attempt — set by the previous iteration. We
+    // decide the wait at the end of an attempt (Retry-After OR linear
+    // backoff, never both) rather than unconditionally at the top, so
+    // honoring a server's `Retry-After: 30` doesn't get an extra
+    // `RETRY_DELAY_MS * attempt` piled on top.
+    let nextDelayMs = 0;
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      if (attempt > 0) {
-        await sleep(RETRY_DELAY_MS * attempt);
+      if (nextDelayMs > 0) {
+        await sleep(nextDelayMs);
+        nextDelayMs = 0;
       }
       try {
         const response = await fetch(url, {
@@ -207,7 +234,9 @@ export class ComplianceApiClient {
               core.info(
                 `${endpoint} responded ${response.status}; honoring Retry-After=${retryAfter}s before next attempt.`,
               );
-              await sleep(Math.min(retryAfter * 1000, 60_000));
+              nextDelayMs = Math.min(retryAfter * 1000, MAX_RETRY_AFTER_MS);
+            } else {
+              nextDelayMs = RETRY_DELAY_MS * (attempt + 1);
             }
             lastError = new Error(
               `API error ${response.status}: ${tryParseError(text) || response.statusText}`,
@@ -222,6 +251,7 @@ export class ComplianceApiClient {
           lastError = new Error(
             `API error ${response.status}: ${tryParseError(text) || response.statusText}`,
           );
+          nextDelayMs = RETRY_DELAY_MS * (attempt + 1);
           continue;
         }
 
@@ -240,6 +270,8 @@ export class ComplianceApiClient {
         ) {
           throw lastError;
         }
+        // Network/timeout error — fall back to linear backoff.
+        nextDelayMs = RETRY_DELAY_MS * (attempt + 1);
       }
     }
 
@@ -349,11 +381,16 @@ export class ComplianceApiClient {
     core.debug(`POST ${url} (${files.length} file(s))`);
 
     let lastError: Error | undefined;
+    // See `postRaw` — delay is set by the previous iteration so a
+    // server-honored Retry-After replaces the linear backoff rather
+    // than stacking on top of it.
+    let nextDelayMs = 0;
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      if (attempt > 0) {
+      if (nextDelayMs > 0) {
         core.info(`Retrying (attempt ${attempt + 1}/${MAX_RETRIES + 1})...`);
-        await sleep(RETRY_DELAY_MS * attempt);
+        await sleep(nextDelayMs);
+        nextDelayMs = 0;
       }
 
       try {
@@ -386,16 +423,18 @@ export class ComplianceApiClient {
 
           // Honor Retry-After on 429/503 — the API uses these for the
           // per-workspace rate limit (#1087) and the tier circuit
-          // breaker (#1091). Rather than the linear retry-attempt
-          // backoff below, sleep for the server-specified interval (or
-          // a sensible cap) before the next try.
+          // breaker (#1091). The server-specified interval REPLACES the
+          // linear backoff for the next attempt; missing header falls
+          // back to linear.
           if (response.status === 429 || response.status === 503) {
             const retryAfter = parseRetryAfter(response.headers.get("retry-after"));
             if (retryAfter !== null) {
               core.info(
                 `API responded ${response.status}; honoring Retry-After=${retryAfter}s before next attempt.`,
               );
-              await sleep(Math.min(retryAfter * 1000, 60_000));
+              nextDelayMs = Math.min(retryAfter * 1000, MAX_RETRY_AFTER_MS);
+            } else {
+              nextDelayMs = RETRY_DELAY_MS * (attempt + 1);
             }
           }
 
@@ -413,6 +452,11 @@ export class ComplianceApiClient {
           lastError = new Error(
             `API error ${response.status}: ${error || text || response.statusText}`,
           );
+          // 5xx (non-503) hits this path too — fall back to linear if
+          // the 429/503 branch above didn't already set a delay.
+          if (nextDelayMs === 0) {
+            nextDelayMs = RETRY_DELAY_MS * (attempt + 1);
+          }
           continue;
         }
 
@@ -435,6 +479,10 @@ export class ComplianceApiClient {
           lastError.message.includes("API error 4")
         ) {
           throw lastError;
+        }
+        // Network/timeout error — fall back to linear backoff.
+        if (nextDelayMs === 0) {
+          nextDelayMs = RETRY_DELAY_MS * (attempt + 1);
         }
       }
     }

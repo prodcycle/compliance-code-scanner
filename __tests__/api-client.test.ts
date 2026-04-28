@@ -714,6 +714,74 @@ describe("ComplianceApiClient", () => {
     expect(fetchSpy).toHaveBeenCalledTimes(2);
     expect(result.scanId).toBe("scan-rl-ok");
   });
+
+  it("Retry-After replaces (not stacks on top of) linear backoff", async () => {
+    // With the old (buggy) code, a 429 with `retry-after: 5` would sleep
+    // 5 s and then sleep `RETRY_DELAY_MS * 1` = 2 s on top. After the
+    // fix only the 5 s sleep should fire. We assert this directly by
+    // running fake timers and checking which delays were queued.
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 429,
+        statusText: "Too Many Requests",
+        headers: new Headers({ "retry-after": "5" }),
+        text: async () =>
+          JSON.stringify({ error: { message: "Rate limit" } }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          status: "success",
+          statusCode: 200,
+          data: {
+            passed: true,
+            findingsCount: 0,
+            findings: [],
+            summary: {
+              total: 0,
+              passed: 0,
+              failed: 0,
+              bySeverity: {},
+              byFramework: {},
+            },
+            scanId: "scan-rl-replaces",
+          },
+        }),
+      } as Response);
+
+    try {
+      const client = new ComplianceApiClient(mockApiUrl, mockApiKey);
+      const promise = client.validate([{ path: "a.tf", content: "" }]);
+
+      // Run all queued timers — under fake timers this doesn't actually
+      // wait, just advances the virtual clock.
+      await vi.runAllTimersAsync();
+      const result = await promise;
+      expect(result.scanId).toBe("scan-rl-replaces");
+
+      // Inspect the recorded sleep durations. Filter out internal 0-ms
+      // microtask scheduling and the AbortSignal.timeout() entries
+      // (those use the request timeout = 120000 ms, not the retry path).
+      const retrySleeps = setTimeoutSpy.mock.calls
+        .map((c) => c[1])
+        .filter(
+          (d): d is number =>
+            typeof d === "number" && d > 0 && d !== 120_000,
+        );
+
+      // Exactly one large delay should have been queued: 5 s. A second
+      // entry of ~2000 ms would mean the linear-backoff is stacking on
+      // top of Retry-After again.
+      expect(retrySleeps).toEqual([5000]);
+    } finally {
+      vi.useRealTimers();
+      setTimeoutSpy.mockRestore();
+    }
+  });
 });
 
 describe("createBatches", () => {
