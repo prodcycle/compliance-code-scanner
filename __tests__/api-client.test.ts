@@ -584,6 +584,204 @@ describe("ComplianceApiClient", () => {
     expect(result.findings[0].startLine).toBe(0);
     expect(result.findings[0].endLine).toBe(0);
   });
+
+  it("falls back to chunked-session flow when 413 includes suggestedEndpoint", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      // First call to /validate → 413 with suggestedEndpoint
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 413,
+        statusText: "Payload Too Large",
+        text: async () =>
+          JSON.stringify({
+            error: {
+              message: "Payload exceeds 5 MB limit",
+              details: {
+                suggestedEndpoint: "/v1/compliance/scans",
+                maxBytes: 5 * 1024 * 1024,
+              },
+            },
+          }),
+      } as Response)
+      // openSession → returns scanId in envelope
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          status: "success",
+          statusCode: 200,
+          data: { scanId: "scan-chunked-99" },
+        }),
+      } as Response)
+      // appendChunk
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          status: "success",
+          statusCode: 200,
+          data: { ok: true },
+        }),
+      } as Response)
+      // completeSession → ValidateResponse-shaped data
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          status: "success",
+          statusCode: 200,
+          data: {
+            passed: true,
+            findingsCount: 0,
+            findings: [],
+            summary: {
+              total: 1,
+              passed: 1,
+              failed: 0,
+              bySeverity: {},
+              byFramework: {},
+            },
+            scanId: "scan-chunked-99",
+          },
+        }),
+      } as Response);
+
+    const client = new ComplianceApiClient(mockApiUrl, mockApiKey);
+    const result = await client.validate(
+      [{ path: "main.tf", content: "x" }],
+      { frameworks: ["soc2"], actor: "octocat" },
+    );
+
+    expect(fetchSpy).toHaveBeenCalledTimes(4);
+    const urls = fetchSpy.mock.calls.map((c) => c[0] as string);
+    expect(urls[0]).toBe("https://api.prodcycle.com/v1/compliance/validate");
+    expect(urls[1]).toBe("https://api.prodcycle.com/v1/compliance/scans");
+    expect(urls[2]).toBe(
+      "https://api.prodcycle.com/v1/compliance/scans/scan-chunked-99/chunks",
+    );
+    expect(urls[3]).toBe(
+      "https://api.prodcycle.com/v1/compliance/scans/scan-chunked-99/complete",
+    );
+    expect(result.passed).toBe(true);
+    expect(result.scanId).toBe("scan-chunked-99");
+
+    // Open-session body forwards frameworks + actor
+    const openBody = JSON.parse(
+      (fetchSpy.mock.calls[1][1] as RequestInit).body as string,
+    );
+    expect(openBody.frameworks).toEqual(["soc2"]);
+    expect(openBody.actor).toBe("octocat");
+
+    // Chunk body has the file in path→content map shape
+    const chunkBody = JSON.parse(
+      (fetchSpy.mock.calls[2][1] as RequestInit).body as string,
+    );
+    expect(chunkBody.files).toEqual({ "main.tf": "x" });
+  });
+
+  it("honors Retry-After on 429 then succeeds on retry", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 429,
+        statusText: "Too Many Requests",
+        headers: new Headers({ "retry-after": "0" }),
+        text: async () =>
+          JSON.stringify({ error: { message: "Rate limit" } }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          status: "success",
+          statusCode: 200,
+          data: {
+            passed: true,
+            findingsCount: 0,
+            findings: [],
+            summary: {
+              total: 0,
+              passed: 0,
+              failed: 0,
+              bySeverity: {},
+              byFramework: {},
+            },
+            scanId: "scan-rl-ok",
+          },
+        }),
+      } as Response);
+
+    const client = new ComplianceApiClient(mockApiUrl, mockApiKey);
+    const result = await client.validate([{ path: "a.tf", content: "" }]);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(result.scanId).toBe("scan-rl-ok");
+  });
+
+  it("Retry-After replaces (not stacks on top of) linear backoff", async () => {
+    // With the old (buggy) code, a 429 with `retry-after: 5` would sleep
+    // 5 s and then sleep `RETRY_DELAY_MS * 1` = 2 s on top. After the
+    // fix only the 5 s sleep should fire. We assert this directly by
+    // running fake timers and checking which delays were queued.
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 429,
+        statusText: "Too Many Requests",
+        headers: new Headers({ "retry-after": "5" }),
+        text: async () =>
+          JSON.stringify({ error: { message: "Rate limit" } }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          status: "success",
+          statusCode: 200,
+          data: {
+            passed: true,
+            findingsCount: 0,
+            findings: [],
+            summary: {
+              total: 0,
+              passed: 0,
+              failed: 0,
+              bySeverity: {},
+              byFramework: {},
+            },
+            scanId: "scan-rl-replaces",
+          },
+        }),
+      } as Response);
+
+    try {
+      const client = new ComplianceApiClient(mockApiUrl, mockApiKey);
+      const promise = client.validate([{ path: "a.tf", content: "" }]);
+
+      // Run all queued timers — under fake timers this doesn't actually
+      // wait, just advances the virtual clock.
+      await vi.runAllTimersAsync();
+      const result = await promise;
+      expect(result.scanId).toBe("scan-rl-replaces");
+
+      // Inspect the recorded sleep durations. Filter out internal 0-ms
+      // microtask scheduling and the AbortSignal.timeout() entries
+      // (those use the request timeout = 120000 ms, not the retry path).
+      const retrySleeps = setTimeoutSpy.mock.calls
+        .map((c) => c[1])
+        .filter(
+          (d): d is number =>
+            typeof d === "number" && d > 0 && d !== 120_000,
+        );
+
+      // Exactly one large delay should have been queued: 5 s. A second
+      // entry of ~2000 ms would mean the linear-backoff is stacking on
+      // top of Retry-After again.
+      expect(retrySleeps).toEqual([5000]);
+    } finally {
+      vi.useRealTimers();
+      setTimeoutSpy.mockRestore();
+    }
+  });
 });
 
 describe("createBatches", () => {

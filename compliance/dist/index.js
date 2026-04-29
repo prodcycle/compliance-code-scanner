@@ -30516,6 +30516,21 @@ const REQUEST_TIMEOUT_MS = 120_000; // 2 minutes
 const MAX_RETRIES = 2;
 const RETRY_DELAY_MS = 2_000;
 /**
+ * Hard ceiling on Retry-After honoring. Even if the server (or an
+ * upstream proxy) asks for an absurd interval we cap it so a misbehaving
+ * tier can't wedge the action job for the full GitHub-Actions step
+ * timeout. Configurable via `COMPLIANCE_MAX_RETRY_AFTER_MS` for operators
+ * who want a different ceiling in their CI.
+ */
+function envInt(name, fallback) {
+    const raw = process.env[name];
+    if (!raw)
+        return fallback;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+const MAX_RETRY_AFTER_MS = envInt("COMPLIANCE_MAX_RETRY_AFTER_MS", 60_000);
+/**
  * Maximum payload size per request in bytes.
  * The API enforces a 5 MB limit; we target 2 MB to leave ample headroom
  * for JSON overhead (keys, brackets, escaping of special characters).
@@ -30545,16 +30560,151 @@ class ComplianceApiClient {
                 return await this.sendBatch(batches[0], options);
             }
             catch (err) {
-                if (err instanceof PayloadTooLargeError && batches[0].length > 1) {
-                    core.warning("Single batch hit 413. Re-splitting into smaller batches.");
-                    const mid = Math.ceil(batches[0].length / 2);
-                    return this.sendBatchesWithSplitting([batches[0].slice(0, mid), batches[0].slice(mid)], options);
+                if (err instanceof PayloadTooLargeError) {
+                    // Server hint: the 5 MB /validate cap was hit and we should
+                    // switch to chunked sessions instead of splitting forever.
+                    // Common path for large monorepo CI runs.
+                    if (err.suggestsChunkedEndpoint) {
+                        core.info("Server returned 413 with suggestedEndpoint=/v1/compliance/scans. Switching to chunked-session flow.");
+                        return this.postChunkedSession(files, options);
+                    }
+                    if (batches[0].length > 1) {
+                        core.warning("Single batch hit 413. Re-splitting into smaller batches.");
+                        const mid = Math.ceil(batches[0].length / 2);
+                        return this.sendBatchesWithSplitting([batches[0].slice(0, mid), batches[0].slice(mid)], options);
+                    }
                 }
                 throw err;
             }
         }
         core.info(`Payload too large for a single request. Splitting into ${batches.length} batch(es).`);
         return this.sendBatchesWithSplitting(batches, options);
+    }
+    /**
+     * Fallback path when /validate's 413 indicates the chunked-session
+     * endpoint is the right answer. We:
+     *   1. Open a session (`POST /v1/compliance/scans`) once for the
+     *      whole CI run — gives us a single scanId in the dashboard.
+     *   2. Append each batch (`POST /v1/compliance/scans/:id/chunks`)
+     *      using the existing 2 MB batch sizing, which is well under
+     *      the chunked-endpoint's 50 MB-per-chunk cap.
+     *   3. Finalize (`POST /v1/compliance/scans/:id/complete`) — server
+     *      computes the final summary + passed verdict.
+     * Map the response to the ValidateResponse shape so callers don't
+     * need to special-case which path was taken.
+     */
+    async postChunkedSession(files, options) {
+        const session = await this.postRaw("/v1/compliance/scans", this.buildOpenSessionBody(options));
+        core.info(`Opened chunked compliance scan session: ${session.scanId}`);
+        const batches = createBatches(files);
+        for (let i = 0; i < batches.length; i++) {
+            core.info(`Appending chunk ${i + 1}/${batches.length} (${batches[i].length} file(s))...`);
+            await this.postRaw(`/v1/compliance/scans/${encodeURIComponent(session.scanId)}/chunks`, { files: batchToFilesMap(batches[i]) });
+        }
+        core.info(`Finalizing scan ${session.scanId}...`);
+        const finalResult = await this.postRaw(`/v1/compliance/scans/${encodeURIComponent(session.scanId)}/complete`, {});
+        return normalizeFindings({ ...finalResult, scanId: session.scanId });
+    }
+    buildOpenSessionBody(options) {
+        const body = {};
+        if (options?.frameworks && options.frameworks.length > 0) {
+            body.frameworks = options.frameworks;
+        }
+        if (options?.actor) {
+            body.actor = options.actor;
+        }
+        // Always send `options` with `include_prompt: true` so the chunked
+        // path produces the same response shape (with remediation prompt) as
+        // sync `/validate`. Previously this object was elided when none of
+        // severityThreshold / failOn / excludeAcceptedRisk were set, so a
+        // bare `validate(files)` taking the chunked fallback would silently
+        // omit the prompt.
+        const optionsBody = { include_prompt: true };
+        if (options?.severityThreshold) {
+            optionsBody.severity_threshold = options.severityThreshold;
+        }
+        if (options?.failOn) {
+            optionsBody.fail_on = options.failOn;
+        }
+        if (options?.excludeAcceptedRisk !== undefined) {
+            optionsBody.exclude_accepted_risk = options.excludeAcceptedRisk;
+        }
+        body.options = optionsBody;
+        return body;
+    }
+    /**
+     * Generic POST helper used by the chunked-session paths. Mirrors the
+     * retry + Retry-After logic in sendBatch but takes a free-form body
+     * and returns the unwrapped envelope's `data`.
+     */
+    async postRaw(endpoint, body) {
+        const url = `${this.apiUrl.replace(/\/+$/, "")}${endpoint}`;
+        let lastError;
+        // Delay BEFORE the next attempt — set by the previous iteration. We
+        // decide the wait at the end of an attempt (Retry-After OR linear
+        // backoff, never both) rather than unconditionally at the top, so
+        // honoring a server's `Retry-After: 30` doesn't get an extra
+        // `RETRY_DELAY_MS * attempt` piled on top.
+        let nextDelayMs = 0;
+        for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+            if (nextDelayMs > 0) {
+                await sleep(nextDelayMs);
+                nextDelayMs = 0;
+            }
+            try {
+                const response = await fetch(url, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        Authorization: `Bearer ${this.apiKey}`,
+                        "x-api-version": "v1",
+                        "User-Agent": "prodcycle/actions/compliance",
+                    },
+                    body: JSON.stringify(body),
+                    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+                });
+                if (!response.ok) {
+                    const text = await response.text().catch(() => "");
+                    if (response.status === 413) {
+                        const parsedBody = tryParseJson(text);
+                        throw new PayloadTooLargeError(`API error 413: ${tryParseError(text) || text || "Request payload too large"}`, parsedBody);
+                    }
+                    if (response.status === 429 || response.status === 503) {
+                        const retryAfter = parseRetryAfter(response.headers.get("retry-after"));
+                        if (retryAfter !== null) {
+                            core.info(`${endpoint} responded ${response.status}; honoring Retry-After=${retryAfter}s before next attempt.`);
+                            nextDelayMs = Math.min(retryAfter * 1000, MAX_RETRY_AFTER_MS);
+                        }
+                        else {
+                            nextDelayMs = RETRY_DELAY_MS * (attempt + 1);
+                        }
+                        lastError = new Error(`API error ${response.status}: ${tryParseError(text) || response.statusText}`);
+                        continue;
+                    }
+                    if (response.status >= 400 && response.status < 500) {
+                        throw new Error(`API error ${response.status}: ${tryParseError(text) || text || response.statusText}`);
+                    }
+                    lastError = new Error(`API error ${response.status}: ${tryParseError(text) || response.statusText}`);
+                    nextDelayMs = RETRY_DELAY_MS * (attempt + 1);
+                    continue;
+                }
+                const envelope = (await response.json());
+                if (envelope.status !== "success" || !envelope.data) {
+                    throw new Error(`Unexpected API response from ${endpoint}: ${envelope.error?.message || JSON.stringify(envelope)}`);
+                }
+                return envelope.data;
+            }
+            catch (err) {
+                lastError = err instanceof Error ? err : new Error(String(err));
+                if (lastError instanceof PayloadTooLargeError ||
+                    lastError.message.includes("API error 4")) {
+                    throw lastError;
+                }
+                // Network/timeout error — fall back to linear backoff.
+                nextDelayMs = RETRY_DELAY_MS * (attempt + 1);
+            }
+        }
+        throw lastError || new Error(`Request to ${endpoint} failed after retries`);
     }
     /**
      * Send a list of batches, automatically re-splitting any batch that
@@ -30627,10 +30777,15 @@ class ComplianceApiClient {
         const url = `${this.apiUrl.replace(/\/+$/, "")}/v1/compliance/validate`;
         core.debug(`POST ${url} (${files.length} file(s))`);
         let lastError;
+        // See `postRaw` — delay is set by the previous iteration so a
+        // server-honored Retry-After replaces the linear backoff rather
+        // than stacking on top of it.
+        let nextDelayMs = 0;
         for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-            if (attempt > 0) {
+            if (nextDelayMs > 0) {
                 core.info(`Retrying (attempt ${attempt + 1}/${MAX_RETRIES + 1})...`);
-                await sleep(RETRY_DELAY_MS * attempt);
+                await sleep(nextDelayMs);
+                nextDelayMs = 0;
             }
             try {
                 const response = await fetch(url, {
@@ -30648,8 +30803,26 @@ class ComplianceApiClient {
                     const text = await response.text().catch(() => "");
                     const error = tryParseError(text);
                     // Surface 413 as a specific error so validate() can re-split
+                    // OR switch to the chunked-session endpoint when the server's
+                    // 413 details point at /v1/compliance/scans (Phase 1d).
                     if (response.status === 413) {
-                        throw new PayloadTooLargeError(`API error 413: ${error || text || "Request payload too large"}`);
+                        const parsedBody = tryParseJson(text);
+                        throw new PayloadTooLargeError(`API error 413: ${error || text || "Request payload too large"}`, parsedBody);
+                    }
+                    // Honor Retry-After on 429/503 — the API uses these for the
+                    // per-workspace rate limit (#1087) and the tier circuit
+                    // breaker (#1091). The server-specified interval REPLACES the
+                    // linear backoff for the next attempt; missing header falls
+                    // back to linear.
+                    if (response.status === 429 || response.status === 503) {
+                        const retryAfter = parseRetryAfter(response.headers.get("retry-after"));
+                        if (retryAfter !== null) {
+                            core.info(`API responded ${response.status}; honoring Retry-After=${retryAfter}s before next attempt.`);
+                            nextDelayMs = Math.min(retryAfter * 1000, MAX_RETRY_AFTER_MS);
+                        }
+                        else {
+                            nextDelayMs = RETRY_DELAY_MS * (attempt + 1);
+                        }
                     }
                     // Don't retry client errors (4xx) except 429
                     if (response.status >= 400 &&
@@ -30658,6 +30831,11 @@ class ComplianceApiClient {
                         throw new Error(`API error ${response.status}: ${error || text || response.statusText}`);
                     }
                     lastError = new Error(`API error ${response.status}: ${error || text || response.statusText}`);
+                    // 5xx (non-503) hits this path too — fall back to linear if
+                    // the 429/503 branch above didn't already set a delay.
+                    if (nextDelayMs === 0) {
+                        nextDelayMs = RETRY_DELAY_MS * (attempt + 1);
+                    }
                     continue;
                 }
                 const envelope = (await response.json());
@@ -30672,6 +30850,10 @@ class ComplianceApiClient {
                 if (lastError instanceof PayloadTooLargeError ||
                     lastError.message.includes("API error 4")) {
                     throw lastError;
+                }
+                // Network/timeout error — fall back to linear backoff.
+                if (nextDelayMs === 0) {
+                    nextDelayMs = RETRY_DELAY_MS * (attempt + 1);
                 }
             }
         }
@@ -30767,11 +30949,25 @@ function mergeResults(results) {
 }
 /**
  * Custom error for 413 responses so the caller can catch and re-split.
+ *
+ * The parsed body is preserved so `validate()` can read
+ * `error.details.suggestedEndpoint` and decide whether the right next
+ * step is to keep splitting batches OR to switch to the chunked-session
+ * endpoint (Phase 1d). When the server says
+ * `suggestedEndpoint = '/v1/compliance/scans'`, that's a strong hint
+ * that the batch is large enough that further splitting will just hit
+ * the same 413 again — chunked sessions are the right answer.
  */
 class PayloadTooLargeError extends Error {
-    constructor(message) {
+    body;
+    constructor(message, body = null) {
         super(message);
+        this.body = body;
         this.name = "PayloadTooLargeError";
+    }
+    /** True when the server hints that we should switch to chunked sessions. */
+    get suggestsChunkedEndpoint() {
+        return (this.body?.error?.details?.suggestedEndpoint === "/v1/compliance/scans");
     }
 }
 exports.PayloadTooLargeError = PayloadTooLargeError;
@@ -30803,8 +30999,52 @@ function tryParseError(text) {
         return undefined;
     }
 }
+/**
+ * Best-effort JSON parse — returns `null` if the body isn't JSON. Used to
+ * pull `error.details.suggestedEndpoint` out of a 413 response without
+ * throwing if the server returned a plain-text error.
+ */
+function tryParseJson(text) {
+    if (!text)
+        return null;
+    try {
+        return JSON.parse(text);
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * Parse the value of a Retry-After response header, which can be either:
+ *   - delta-seconds: an integer number of seconds (e.g. "30")
+ *   - HTTP-date: an absolute date (e.g. "Wed, 21 Oct 2026 07:28:00 GMT")
+ * Returns the wait in seconds, or null if the header is missing/unparseable.
+ *
+ * Helper for honoring the rate-limit (429) and circuit-breaker (503)
+ * server signals — see Phase 1c (#1087) and Phase 1e (#1091).
+ */
+function parseRetryAfter(value) {
+    if (!value)
+        return null;
+    const seconds = Number(value);
+    if (Number.isFinite(seconds) && seconds >= 0)
+        return seconds;
+    const date = Date.parse(value);
+    if (Number.isFinite(date)) {
+        const delta = Math.max(0, Math.ceil((date - Date.now()) / 1000));
+        return delta;
+    }
+    return null;
+}
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+/** Convert a batch (array of files w/ content) to the API's path→content map. */
+function batchToFilesMap(batch) {
+    const map = {};
+    for (const f of batch)
+        map[f.path] = f.content;
+    return map;
 }
 
 
